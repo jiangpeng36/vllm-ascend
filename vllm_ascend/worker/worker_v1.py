@@ -35,7 +35,7 @@ from vllm.model_executor import set_random_seed
 from vllm.utils import STR_DTYPE_TO_TORCH_DTYPE, GiB_bytes
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
-from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.outputs import ModelRunnerOutput, PrepareOutput, ForwardOutput
 from vllm.v1.worker.worker_base import WorkerBase
 
 from vllm_ascend.ascend_config import init_ascend_config
@@ -175,12 +175,37 @@ class NPUWorker(WorkerBase):
             peak_memory)
         return int(available_kv_cache_memory)
 
+    def fake_execute_model(
+        self
+    ) -> Optional[ModelRunnerOutput]:
+        output = self.model_runner.fake_execute_model()
+        return output if self.is_driver_worker else None
+
+    def post_process(
+        self,
+        prepare_output: "PrepareOutput",
+        forward_output: "ForwardOutput",
+        run_count,
+    ) -> Optional[ModelRunnerOutput]:
+        output = self.model_runner.post_process(prepare_output, forward_output, run_count)
+        return output if self.is_driver_worker else None
+
+    def run_forward(
+        self,
+        prepare_output: "PrepareOutput",
+    ) -> Optional[ForwardOutput]:
+        output = self.model_runner.run_forward(prepare_output)
+        return output
+
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
-    ) -> Optional[ModelRunnerOutput]:
-        output = self.model_runner.execute_model(scheduler_output)
-        return output if self.is_driver_worker else None
+        prep_count,
+        forward_output: "ForwardOutput",
+    ) -> Optional[ForwardOutput]:
+        output = self.model_runner.execute_model(scheduler_output, prep_count, forward_output)
+        # return output if self.is_driver_worker else None
+        return output
 
     def load_model(self) -> None:
         if self.vllm_config.model_config.enable_sleep_mode:

@@ -292,6 +292,11 @@ class AscendAttentionBackendImpl(AttentionImpl):
                                  dtype=query.dtype,
                                  device=query.device)
         if trace_flag:
+            # print("queryx", query, query.shape)
+            # print("keyx", key, key.shape)
+            # print("valuex", value, value.shape)
+            # print("outputx", output, output.shape)
+            # print("layer_namex", layer.layer_name)
             torch.ops.vllm.unified_ascend_attention_with_output(
                 query=query,
                 key=key,

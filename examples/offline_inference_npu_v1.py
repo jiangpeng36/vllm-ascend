@@ -23,6 +23,7 @@ from vllm import LLM, SamplingParams
 
 os.environ["VLLM_USE_V1"] = "1"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "1,3"
 
 if __name__ == "__main__":
     prompts = [
@@ -35,7 +36,7 @@ if __name__ == "__main__":
     # Create a sampling params object.
     sampling_params = SamplingParams(max_tokens=100, temperature=0.0)
     # Create an LLM.
-    llm = LLM(model="/data/weights/deepseek-ai/deepseekv3-lite-base-latest",
+    llm = LLM(model="/home/jp/model/Qwen2.5-0.5B-Instruct",
               tensor_parallel_size=2,
               enforce_eager=True,
               trust_remote_code=True,
