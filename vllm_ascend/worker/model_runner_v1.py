@@ -107,7 +107,7 @@ else:
 
 if TYPE_CHECKING:
     import xgrammar as xgr  # type: ignore[import-untyped]
-    from vllm.v1.core.sched.output import SchedulerOutput
+    from vllm.v1.core.sched.output import GrammarBitmask, SchedulerOutput
 else:
     xgr = LazyLoader("xgr", globals(), "xgrammar")
 
@@ -1405,9 +1405,13 @@ class NPUModelRunner(LoRAModelRunnerMixin):
     def apply_grammar_bitmask(
         self,
         scheduler_output: "SchedulerOutput",
+        bitmask: Optional["GrammarBitmask"],
         logits: torch.Tensor,
     ) -> torch.Tensor:
-        grammar_bitmask = scheduler_output.grammar_bitmask
+        if bitmask is None:
+            return
+        structured_output_request_ids = bitmask.structured_output_request_ids
+        grammar_bitmask = bitmask.grammar_bitmask
 
         # We receive the structured output bitmask from the scheduler,
         # compacted to contain bitmasks only for structured output requests.
@@ -1426,7 +1430,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             logit_index = batch_index + cumulative_offset
             cumulative_offset += len(
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id, []))
-            if req_id in scheduler_output.structured_output_request_ids:
+            if req_id in structured_output_request_ids:
                 struct_out_req_batch_indices[req_id] = logit_index
 
         out_indices = []
@@ -1436,8 +1440,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                        shape=(logits.shape[0],
                                               grammar_bitmask.shape[1]))
         cumulative_index = 0
-        seq = sorted(scheduler_output.structured_output_request_ids.items(),
-                     key=lambda x: x[1])
+        seq = sorted(structured_output_request_ids.items(), key=lambda x: x[1])
         for req_id, _ in seq:
             logit_index = struct_out_req_batch_indices[req_id]
             num_spec_tokens = len(
@@ -1557,22 +1560,24 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             )
         return modelrunner_output
 
+    def prepare_inputs(self, scheduler_output: "SchedulerOutput"):
+        # NOTE(woosuk): For now, this method only exists to fetch the
+        # scheduler output from shared memory and cache it.
+        # TODO(woosuk): Move more ops to this method.
+        self._scheduler_output = scheduler_output
+
     @torch.inference_mode()
     def execute_model(
         self,
-        scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
-    ) -> Union[ModelRunnerOutput, torch.Tensor]:
+    ) -> Optional[IntermediateTensors]:
+        scheduler_output = self._scheduler_output
+        self._sample_scheduler_output = scheduler_output
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
-                if not has_kv_transfer_group():
-                    logger.debug(
-                        "skip this step for we receive the data from remote disaggregate prefill node"
-                    )
-                    # Return empty ModelRunnerOuptut if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output)
+                return None
+
             (attn_metadata, positions, num_scheduled_tokens_np,
              num_input_tokens, num_tokens_across_dp,
              padded_num_tokens_across_dp, logits_indices, spec_decode_metadata,
@@ -1633,15 +1638,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 assert isinstance(hidden_states, IntermediateTensors)
                 get_pp_group().send_tensor_dict(
                     hidden_states.tensors, all_gather_group=get_tp_group())
+                sample_hidden_states = None
                 logits = None
             else:
                 if self.input_batch.pooling_params:
-                    return self._pool(
-                        hidden_states,
-                        scheduler_output.total_num_scheduled_tokens,
-                        num_scheduled_tokens_np, finished_sending,
-                        finished_recving, kv_connector_output)
-                sample_hidden_states = hidden_states[logits_indices]
+                    sample_hidden_states = None
+                    logits = None
+                else:
+                    sample_hidden_states = hidden_states[logits_indices]
                 logits = self.model.compute_logits(sample_hidden_states, None)
             if broadcast_pp_output:
                 model_output_broadcast_data = {
@@ -1653,9 +1657,60 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 assert model_output_broadcast_data is not None
                 logits = model_output_broadcast_data["logits"]
 
+        # FIXME(woosuk): This is hacky. Refactor this.
+        self._num_scheduled_tokens_np = num_scheduled_tokens_np
+        self._spec_decode_metadata = spec_decode_metadata
+        self._attn_metadata = attn_metadata
+        self._hidden_states = hidden_states
+        self._aux_hidden_states = aux_hidden_states
+        self._sample_hidden_states = sample_hidden_states
+        self._logits = logits
+        self._kv_connector_output = kv_connector_output
+        self._finished_sending = finished_sending
+        self._finished_recving = finished_recving
+        self._positions = positions
+        return None
+
+    def sample(
+        self,
+        grammar_bitmask: Optional["GrammarBitmask"],
+    ) -> ModelRunnerOutput:
+        # Compute logits.
+        if not get_pp_group().is_last_rank:
+            return EMPTY_MODEL_RUNNER_OUTPUT
+
+        scheduler_output = self._sample_scheduler_output
+        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
+        if num_scheduled_tokens == 0:
+                if not has_kv_transfer_group():
+                    logger.debug(
+                        "skip this step for we receive the data from remote disaggregate prefill node"
+                    )
+                    # Return empty ModelRunnerOuptut if there's no work to do.
+                    return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.kv_connector_no_forward(scheduler_output)
+        num_scheduled_tokens_np = self._num_scheduled_tokens_np
+        spec_decode_metadata = self._spec_decode_metadata
+        spec_decode_common_attn_metadata = self._spec_decode_common_attn_metadata
+        hidden_states = self._hidden_states
+        aux_hidden_states = self._aux_hidden_states
+        sample_hidden_states = self._sample_hidden_states
+        logits = self._logits
+        kv_connector_output = self._kv_connector_output
+        finished_sending = self._finished_sending
+        finished_recving = self._finished_recving
+        attn_metadata = self._attn_metadata
+        positions = self._positions
+        if self.input_batch.pooling_params:
+            return self._pool(
+                hidden_states,
+                scheduler_output.total_num_scheduled_tokens,
+                num_scheduled_tokens_np, finished_sending,
+                finished_recving, kv_connector_output)
             # Apply structured output bitmasks if present
-            if scheduler_output.grammar_bitmask is not None:
-                logits = self.apply_grammar_bitmask(scheduler_output, logits)
+        if grammar_bitmask is not None:
+            self.apply_grammar_bitmask(scheduler_output, grammar_bitmask,
+                                       logits)
 
             # Sample the next token and get logprobs if needed.
             sampling_metadata = self.input_batch.sampling_metadata
