@@ -1620,8 +1620,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 finished_recving=finished_recving)
         else:
             kv_connector_output = None
-        finished_sending = None
-        finished_recving = None
         with ProfileExecuteDuration().capture_async("post process"):
             # Broadcast PP output for external_launcher (torchrun)
             # to make sure we are synced across pp ranks
@@ -1666,8 +1664,6 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._sample_hidden_states = sample_hidden_states
         self._logits = logits
         self._kv_connector_output = kv_connector_output
-        self._finished_sending = finished_sending
-        self._finished_recving = finished_recving
         self._positions = positions
         return None
 
@@ -1682,35 +1678,35 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         scheduler_output = self._sample_scheduler_output
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if num_scheduled_tokens == 0:
-                if not has_kv_transfer_group():
-                    logger.debug(
-                        "skip this step for we receive the data from remote disaggregate prefill node"
-                    )
-                    # Return empty ModelRunnerOuptut if there's no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output)
+            if not has_kv_transfer_group():
+                logger.debug(
+                    "skip this step for we receive the data from remote disaggregate prefill node"
+                )
+                # Return empty ModelRunnerOuptut if there's no work to do.
+                return EMPTY_MODEL_RUNNER_OUTPUT
+            return self.kv_connector_no_forward(scheduler_output)
         num_scheduled_tokens_np = self._num_scheduled_tokens_np
         spec_decode_metadata = self._spec_decode_metadata
-        spec_decode_common_attn_metadata = self._spec_decode_common_attn_metadata
         hidden_states = self._hidden_states
         aux_hidden_states = self._aux_hidden_states
-        sample_hidden_states = self._sample_hidden_states
         logits = self._logits
         kv_connector_output = self._kv_connector_output
-        finished_sending = self._finished_sending
-        finished_recving = self._finished_recving
         attn_metadata = self._attn_metadata
         positions = self._positions
-        if self.input_batch.pooling_params:
-            return self._pool(
-                hidden_states,
-                scheduler_output.total_num_scheduled_tokens,
-                num_scheduled_tokens_np, finished_sending,
-                finished_recving, kv_connector_output)
+        finished_sending = None
+        finished_recving = None
+
+        with ProfileExecuteDuration().capture_async("sample process"):
+            if self.input_batch.pooling_params:
+                return self._pool(
+                    hidden_states,
+                    scheduler_output.total_num_scheduled_tokens,
+                    num_scheduled_tokens_np, finished_sending,
+                    finished_recving, kv_connector_output)
             # Apply structured output bitmasks if present
-        if grammar_bitmask is not None:
-            self.apply_grammar_bitmask(scheduler_output, grammar_bitmask,
-                                       logits)
+            if grammar_bitmask is not None:
+                self.apply_grammar_bitmask(scheduler_output, grammar_bitmask,
+                                        logits)
 
             # Sample the next token and get logprobs if needed.
             sampling_metadata = self.input_batch.sampling_metadata
