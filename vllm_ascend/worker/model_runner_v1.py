@@ -99,6 +99,8 @@ from vllm_ascend.utils import (ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ,
 from vllm_ascend.worker.eagle_proposer_v1 import EagleProposer
 from vllm_ascend.worker.mtp_proposer_v1 import MtpProposer
 from vllm_ascend.worker.npu_input_batch import CachedRequestState, InputBatch
+import threading
+import traceback
 
 if not vllm_version_is("0.10.1.1"):
     from vllm.v1.outputs import DraftTokenIds
@@ -389,6 +391,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # distinct requests - clearing the cached states for the first request
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
+            print("remove_request", req_id)
+            # traceback.print_stack()
             self.input_batch.remove_request(req_id)
 
         # Free the cached encoder outputs.
@@ -412,6 +416,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # have low request overlap (e.g., alternating between two distinct
         # sets of requests), this optimization becomes very inefficient.
         for req_id in unscheduled_req_ids:
+            print("remove_request1", req_id)
+            # traceback.print_stack()
             self.input_batch.remove_request(req_id)
 
         req_ids_to_add: list[str] = []
@@ -1424,7 +1430,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         # request in the batch, as the logit indices are offset by this amount.
         struct_out_req_batch_indices: dict[str, int] = {}
         cumulative_offset = 0
-        seq = sorted(self.input_batch.req_id_to_index.items(),
+        seq = sorted(self._input_batch.req_id_to_index.items(),
                      key=lambda x: x[1])
         for req_id, batch_index in seq:
             logit_index = batch_index + cumulative_offset
@@ -1512,8 +1518,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         finished_recving: Optional[set[str]] = None,
         kv_connector_output: Optional["KVConnectorOutput"] = None,
     ) -> ModelRunnerOutput:
-        assert self.input_batch.num_reqs ==\
-            len(self.input_batch.pooling_params), \
+        assert self._input_batch.num_reqs ==\
+            len(self._input_batch.pooling_params), \
         "Either all or none of the requests in" \
         " a batch must be pooling request"
 
@@ -1521,14 +1527,14 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             torch.split(hidden_states[:num_scheduled_tokens],
                         num_scheduled_tokens_np.tolist()))
 
-        pooling_metadata = self.input_batch.pooling_metadata
+        pooling_metadata = self._input_batch.pooling_metadata
 
         raw_pooler_output = self.model.pooler(
             hidden_states=extracted_hidden_states,
             pooling_metadata=pooling_metadata)
 
         pooler_output: list[Optional[torch.Tensor]] = []
-        seq_lens = self.seq_lens[:self.input_batch.num_reqs]
+        seq_lens = self.seq_lens[:self._input_batch.num_reqs]
         for raw_output, seq_len, prompt_len in zip(
                 raw_pooler_output, seq_lens, pooling_metadata.prompt_lens):
 
@@ -1539,8 +1545,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         extra_args = ({"kv_connector_output": kv_connector_output})
         if vllm_version_is("0.10.1.1"):
             modelrunner_output = ModelRunnerOutput(
-                req_ids=self.input_batch.req_ids,
-                req_id_to_index=self.input_batch.req_id_to_index,
+                req_ids=self._input_batch.req_ids,
+                req_id_to_index=self._input_batch.req_id_to_index,
                 sampled_token_ids=[],
                 spec_token_ids=None,
                 logprobs=None,
@@ -1550,8 +1556,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             )
         else:
             modelrunner_output = ModelRunnerOutput(
-                req_ids=self.input_batch.req_ids,
-                req_id_to_index=self.input_batch.req_id_to_index,
+                req_ids=self._input_batch.req_ids,
+                req_id_to_index=self._input_batch.req_id_to_index,
                 sampled_token_ids=[],
                 logprobs=None,
                 prompt_logprobs_dict={},
@@ -1560,11 +1566,23 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             )
         return modelrunner_output
 
+    def print_thread(self, str, end_str:Optional[str] = ""):
+        # curtrd = threading.current_thread()
+        # print(str, curtrd.name, curtrd.ident)
+        current_time_ns = time.perf_counter_ns()
+        # print(str, current_time_ns, end_str)
+
     def prepare_inputs(self, scheduler_output: "SchedulerOutput"):
         # NOTE(woosuk): For now, this method only exists to fetch the
         # scheduler output from shared memory and cache it.
         # TODO(woosuk): Move more ops to this method.
+        self.print_thread("prepare_inputs start")
         self._scheduler_output = scheduler_output
+        self._input_batch = copy.deepcopy(self.input_batch)
+        self._requests = copy.deepcopy(self.requests)
+        self.smp_scheduler_output = copy.deepcopy(scheduler_output)
+        self.print_thread("prepare_inputs done ", "\n")
+        # print("xxxxx1", self._input_batch.req_ids, self.smp_scheduler_output.num_scheduled_tokens)
 
     @torch.inference_mode()
     def execute_model(
@@ -1585,6 +1603,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
              intermediate_tensors) = (self._prepare_inputs(
                  scheduler_output, intermediate_tensors))
 
+        self.print_thread("execute_model start")
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
             with set_ascend_forward_context(
@@ -1665,6 +1684,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self._logits = logits
         self._kv_connector_output = kv_connector_output
         self._positions = positions
+        self.print_thread("execute_model done ", "\n")
         return None
 
     def sample(
@@ -1675,7 +1695,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         if not get_pp_group().is_last_rank:
             return EMPTY_MODEL_RUNNER_OUTPUT
 
-        scheduler_output = self._sample_scheduler_output
+        scheduler_output = self.smp_scheduler_output
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         if num_scheduled_tokens == 0:
             if not has_kv_transfer_group():
@@ -1695,9 +1715,10 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         positions = self._positions
         finished_sending = None
         finished_recving = None
+        self.print_thread("sample start")
 
         with ProfileExecuteDuration().capture_async("sample process"):
-            if self.input_batch.pooling_params:
+            if self._input_batch.pooling_params:
                 return self._pool(
                     hidden_states,
                     scheduler_output.total_num_scheduled_tokens,
@@ -1709,7 +1730,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                                         logits)
 
             # Sample the next token and get logprobs if needed.
-            sampling_metadata = self.input_batch.sampling_metadata
+            sampling_metadata = self._input_batch.sampling_metadata
             if spec_decode_metadata is None:
                 sampler_output = self.sampler(
                     logits=logits,
@@ -1747,14 +1768,17 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             # TODO(woosuk): The following loop can be slow since it iterates over
             # the requests one by one. Optimize.
             discard_sampled_tokens_req_indices = []
-            for i, req_id in enumerate(self.input_batch.req_ids):
-                req_state = self.requests[req_id]
+            for i, req_id in enumerate(self._input_batch.req_ids):
+                # print("xxxxx", i, req_id, self._input_batch.req_ids, scheduler_output.num_scheduled_tokens)
+                if req_id not in scheduler_output.num_scheduled_tokens:
+                    continue
+                req_state = self._requests[req_id]
                 seq_len = (req_state.num_computed_tokens +
                            scheduler_output.num_scheduled_tokens[req_id])
                 if seq_len < req_state.num_tokens:
                     # Ignore the sampled token.
                     # Rewind the generator state as if the token was not sampled.
-                    generator = self.input_batch.generators.get(i)
+                    generator = self._input_batch.generators.get(i)
                     if generator is not None:
                         generator.set_offset(generator.get_offset() - 4)
                     discard_sampled_tokens_req_indices.append(i)
@@ -1781,7 +1805,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 # Includes spec decode tokens.
                 valid_sampled_token_ids = self.rejection_sampler.parse_output(
                     sampled_token_ids,
-                    self.input_batch.vocab_size,
+                    self._input_batch.vocab_size,
                 )
 
             for i in discard_sampled_tokens_req_indices:
@@ -1795,18 +1819,21 @@ class NPUModelRunner(LoRAModelRunnerMixin):
                 if not sampled_ids:
                     continue
 
-                start_idx = self.input_batch.num_tokens_no_spec[req_idx]
+                start_idx = self._input_batch.num_tokens_no_spec[req_idx]
                 end_idx = start_idx + len(sampled_ids)
                 assert end_idx <= self.model_config.max_model_len, (
                     "Sampled token IDs exceed the max model length. "
                     f"Total number of tokens: {end_idx} > max_model_len: "
                     f"{self.model_config.max_model_len}")
 
-                self.input_batch.token_ids_cpu[req_idx,
+                self._input_batch.token_ids_cpu[req_idx,
                                                start_idx:end_idx] = sampled_ids
-                self.input_batch.num_tokens_no_spec[req_idx] = end_idx
-                self.input_batch.num_tokens[req_idx] = end_idx
-                req_id = self.input_batch.req_ids[req_idx]
+                self._input_batch.num_tokens_no_spec[req_idx] = end_idx
+                self._input_batch.num_tokens[req_idx] = end_idx
+                req_id = self._input_batch.req_ids[req_idx]
+                # print("Engine background task failed", req_id, self._input_batch.req_ids)
+                if req_id not in self.requests:
+                    continue
                 req_state = self.requests[req_id]
                 req_state.output_token_ids.extend(sampled_ids)
 
@@ -1830,8 +1857,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
 
         if vllm_version_is("0.10.1.1"):
             model_runner_output = ModelRunnerOutput(
-                req_ids=self.input_batch.req_ids,
-                req_id_to_index=self.input_batch.req_id_to_index,
+                req_ids=self._input_batch.req_ids,
+                req_id_to_index=self._input_batch.req_id_to_index,
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 spec_token_ids=self._draft_token_ids,
@@ -1841,8 +1868,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             )
         else:
             model_runner_output = ModelRunnerOutput(
-                req_ids=self.input_batch.req_ids,
-                req_id_to_index=self.input_batch.req_id_to_index,
+                req_ids=self._input_batch.req_ids,
+                req_id_to_index=self._input_batch.req_id_to_index,
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
@@ -1859,7 +1886,7 @@ class NPUModelRunner(LoRAModelRunnerMixin):
             captured_name = "Decode" if self.attn_state == AscendAttentionState.DecodeOnly else "Prefill"
             logger.info("Profile execute duration [%s]:%s", captured_name,
                         " ".join(dr_str))
-
+        # print("model_runner_output", model_runner_output)
         return model_runner_output
 
     def take_draft_token_ids(self) -> Optional[DraftTokenIds]:

@@ -20,8 +20,9 @@
 # isort: skip_file
 import os
 
-os.environ["VLLM_USE_MODELSCOPE"] = "True"
+#os.environ["VLLM_USE_MODELSCOPE"] = "True"
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
+os.environ["ASCEND_RT_VISIBLE_DEVICES"] = "2,3"
 
 from vllm import LLM, SamplingParams
 
@@ -37,7 +38,7 @@ def main():
     # Create a sampling params object.
     sampling_params = SamplingParams(max_tokens=100, temperature=0.0)
     # Create an LLM.
-    llm = LLM(model="deepseek-ai/DeepSeek-V2-Lite",
+    llm = LLM(model="/home/jp/model/Qwen2.5-0.5B-Instruct",
               tensor_parallel_size=2,
               enforce_eager=True,
               trust_remote_code=True,
