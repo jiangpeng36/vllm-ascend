@@ -424,6 +424,8 @@ class NPUModelRunner(LoRAModelRunnerMixin):
         self.async_output_copy_stream = torch.npu.Stream() if \
             self.use_async_scheduling else None
 
+        print("self.use_async_scheduling", self.use_async_scheduling)
+
     def _use_aclgraph(self) -> bool:
         return self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE and self.compilation_config.level == CompilationLevel.PIECEWISE and not self.model_config.enforce_eager
 
